@@ -1,9 +1,6 @@
 # Code for Fairer Preferences Elicit Improved Human-Aligned Large Language Model Judgments
 
-<p align="center">
-    <img src="figs/zepo.png" alt="zepo" width="500" />
-</p>
-
+![zepo](figs/zepo.png)
 **Link to paper**:
 [Fairer Preferences Elicit Improved Human-Aligned Large Language Model Judgments](https://arxiv.org/abs/2406.11370). arXiv preprint arXiv:2406.11370.
 
