@@ -1,0 +1,221 @@
+from typing import List
+from transformers import LlamaForCausalLM, AutoTokenizer
+import torch
+import numpy as np
+from transformers import logging
+import torch.nn.functional as F
+import sys
+
+sys.path.append("../")
+from utils import CompareResultObject, calculate_uncertainty
+from prompts import get_cot_eval_prompt_template
+
+logging.set_verbosity_error()
+
+
+device = "cuda"
+
+
+def is_integer_string(s):
+    return s.isdigit()
+
+
+class Llama3ModelLocal:
+    def __init__(self, params):
+        self.model_name = params["model"]
+        self.temperature = params["temperature"] if "temperature" in params else 0
+        self.max_tokens = params["max_tokens"] if "max_tokens" in params else 128
+        self.do_sample = params["do_sample"] if "do_sample" in params else False
+        self.do_cot = params["cot"] if "cot" in params else False
+        self.cot_eval_template = None
+        if self.do_cot:
+            self.max_tokens = 350
+        self.device = device
+        if "cache_dir" not in params:
+            params["cache_dir"] = None
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name, padding_side="left"
+        )
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = LlamaForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.bfloat16,
+            device_map=self.device,
+            attn_implementation="flash_attention_2",
+        )
+        self.model.eval()
+        self.A_ids = self.tokenizer.convert_tokens_to_ids(["A", "ĠA"])
+        self.B_ids = self.tokenizer.convert_tokens_to_ids(["B", "ĠB"])
+        self.C_ids = self.tokenizer.convert_tokens_to_ids(["C", "ĠC"])
+        self.score_ids = self.tokenizer.convert_tokens_to_ids(["1", "2", "3", "4", "5"])
+        print("Model {} loaded".format(self.model_name))
+
+    def rate_score(self, prompt):
+        sequence, output = self.local_model_chat_completion(prompt)
+        score, logprobs = self.extract_score(sequence, output.logits)
+        print(score)
+        return score, logprobs
+
+    def compare(self, prompts) -> List[CompareResultObject]:
+        """
+        prompts: [batch_size, seq_len]
+        output: a list of compare_result_object, [batch_size]
+        """
+        sequence, output = self.local_model_chat_completion(prompts)
+        compare_results = []
+        for idx in range(sequence.shape[0]):
+            seq_logits = [
+                logits[idx] for logits in output.logits
+            ]  # convert to [seq_len, vocab_size]
+            compare_result = self.extract_probs(sequence[idx], seq_logits)
+            compare_results.append(compare_result)
+        return compare_results
+
+    def generate(self, prompts):
+        sequence, output = self.local_model_chat_completion(prompts)
+        # Skip special tokens and role tokens
+        generated_text = self.tokenizer.batch_decode(
+            sequence[:, 4:], skip_special_tokens=True
+        )
+        return generated_text
+
+    def debug_generate(self, prompts):
+        A_id = self.tokenizer.convert_tokens_to_ids("A")
+        B_id = self.tokenizer.convert_tokens_to_ids("B")
+        print(A_id, B_id)
+        sequence, output = self.local_model_chat_completion(prompts)
+        generated_text = self.tokenizer.batch_decode(
+            sequence[:, 4:], skip_special_tokens=True
+        )
+        prob = torch.softmax(output.logits[4], dim=-1)
+        print(prob)
+        a_prob = prob[0, A_id]
+        b_prob = prob[0, B_id]
+
+        a_normp = a_prob / (a_prob + b_prob)
+        b_normp = b_prob / (a_prob + b_prob)
+        print(a_normp, b_normp)
+
+        return sequence, output, generated_text, [a_normp, b_normp]
+
+    def extract_score(self, sequence, logits):
+        """
+        sequence: [batch_size, seq_len]
+        logits: seq_len x [batch_size, vocab_size]
+        output: int score
+        """
+        for idx, token_id in enumerate(sequence[0]):
+            logit = logits[idx][0]
+            logprobs = F.log_softmax(logit, dim=-1).cpu()
+            score_logprobs = logprobs[self.score_ids].tolist()
+            token = self.tokenizer.decode(token_id)
+            if is_integer_string(token):
+                return int(token), score_logprobs
+        print("Failed to extract score")
+        print(self.tokenizer.batch_decode(sequence))
+        return 3, [np.log(0.2)] * 5
+
+    def extract_probs(self, sequence, logits) -> CompareResultObject:
+        """
+        sequence: [seq_len]
+        logits: seq_len x [vocab_size]
+        output: compare_result_object
+        """
+        # First token logit
+        for idx, token_id in enumerate(sequence):
+            if token_id in self.A_ids or token_id in self.B_ids:
+                logit = logits[idx]
+                probs = F.softmax(logit, dim=-1)
+                prob_A = sum([probs[a_id].item() for a_id in self.A_ids])
+                prob_B = sum([probs[b_id].item() for b_id in self.B_ids])
+                prob_C = sum([probs[c_id].item() for c_id in self.C_ids])
+                logit_A = sum([logit[a_id].item() for a_id in self.A_ids])
+                logit_B = sum([logit[b_id].item() for b_id in self.B_ids])
+                logit_C = sum([logit[c_id].item() for c_id in self.C_ids])
+                uncertainty = calculate_uncertainty([prob_A, prob_B])
+                compare_result = CompareResultObject(
+                    raw_prob_A=prob_A,
+                    raw_prob_B=prob_B,
+                    raw_prob_C=prob_C,
+                    uncertainty=uncertainty,
+                    logit_A=logit_A,
+                    logit_B=logit_B,
+                    logit_C=logit_C,
+                )
+                return compare_result
+        print("Failed to extract probs")
+        print(self.tokenizer.batch_decode([sequence]))
+        return CompareResultObject(raw_prob_A=0.5, raw_prob_B=0.5, uncertainty=1)
+
+    def cot_compare(self, decoded_sequence):
+        """
+        input:
+            decoded_sequence: [batch_size, seq_len]
+        output:
+            compare_response: [batch_size, seq_len]
+        """
+        pass
+
+    def local_model_chat_completion(self, prompts):
+        messages = []
+        for prompt in prompts:
+            msg = Llama3ModelLocal.get_chat_message(prompt)
+            msg = self.tokenizer.apply_chat_template(
+                msg, tokenize=False
+            )  # return_tensors="pt", return_dict=True)
+            messages.append(msg)
+
+        input = self.tokenizer(messages, return_tensors="pt", padding=True)
+        input = input.to(device)
+        output = self.model.generate(
+            **input,
+            return_dict_in_generate=True,
+            pad_token_id=self.tokenizer.eos_token_id,
+            output_logits=True,
+            max_new_tokens=self.max_tokens,
+            do_sample=self.do_sample,
+            temperature=None,
+            top_p=None
+        )
+
+        newly_generated_tokens = output.sequences[:, input.input_ids.shape[-1] :]
+        return newly_generated_tokens, output
+
+    @staticmethod
+    def get_chat_message(prompt, chat_system_instruction=None):
+        if chat_system_instruction:
+            message = [
+                {"role": "system", "content": chat_system_instruction},
+                {"role": "user", "content": prompt},
+            ]
+        else:
+            message = [{"role": "user", "content": prompt}]
+        return message
+
+
+if __name__ == "__main__":
+    example_prompt = """\
+Evaluate and compare the coherence of the two following summary candidates for the given input source text.
+
+Input source text: Paul Merson has restarted his row with Andros Townsend after the Tottenham midfielder was brought on with only seven minutes remaining in his team's 0-0 draw with Burnley on Sunday. 'Just been watching the game, did you miss the coach? #RubberDub #7minutes,' Merson put on Twitter. Merson initially angered Townsend for writing in his Sky Sports column that 'if Andros Townsend can get in (the England team) then it opens it up to anybody.' Paul Merson had another dig at Andros Townsend after his appearance for Tottenham against Burnley Townsend was brought on in the 83rd minute for Tottenham as they drew 0-0 against Burnley Andros Townsend scores England's equaliser in their 1-1 friendly draw with Italy in Turin on Tuesday night The former Arsenal man was proven wrong when Townsend hit a stunning equaliser for England against Italy and he duly admitted his mistake. 'It's not as though I was watching hoping he wouldn't score for England, I'm genuinely pleased for him and fair play to him – it was a great goal,' Merson said. 'It's just a matter of opinion, and my opinion was that he got pulled off after half an hour at Manchester United in front of Roy Hodgson, so he shouldn't have been in the squad. 'When I'm wrong, I hold my hands up. I don't have a problem with doing that - I'll always be the first to admit when I'm wrong.' Townsend hit back at Merson on Twitter after scoring for England against Italy Sky Sports pundit  Merson (centre) criticised Townsend's call-up to the England squad last week Townsend hit back at Merson after netting for England in Turin on Wednesday, saying 'Not bad for a player that should be 'nowhere near the squad' ay @PaulMerse?' Any bad feeling between the pair seemed to have passed but Merson was unable to resist having another dig at Townsend after Tottenham drew at Turf Moor.
+
+Compare the following outputs:
+
+Summary candidate A: paul merson was brought on with only seven minutes remaining in his team 's 0-0 draw with burnley . andros townsend scored the tottenham midfielder in the 89th minute . paul merson had another dig at andros townsend after his appearance . the midfielder had been brought on to the england squad last week . click here for all the latest arsenal news news .
+
+Summary candidate B: paul merson has restarted his row with andros townsend . the tottenham midfielder was brought on with only seven minutes remaining in his team 's 0-0 draw with burnley . andros townsend scores england 's equaliser in their 1-1 friendly draw with italy in turin .
+
+Question: Which summary candidate has better coherence? If the candidate A is better, please return 'A'. If the candidate B is better, please return 'B'. You must return the choice only.
+Answer: \
+"""
+
+    import os
+
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    model = Llama3ModelLocal({"model": "meta-llama/Meta-Llama-3-8B"})
+
+    result = model.compare(example_prompt)
+
+    print(result.prob_A)
