@@ -12,6 +12,7 @@ from models.llama2 import Llama2ModelLocal
 from models.llama3 import Llama3ModelLocal
 from models.mistral import MistralModelLocal
 from models.openai_api import OpenAIChatModel
+from models.local_model import LocalModel
 import os
 
 
@@ -82,6 +83,9 @@ def compute_pairwise_preference_matrix(
             count += 1
         prompts.append(prompt)
 
+    # print(prompts[0])
+    # print(prompts[1])
+    # assert False
     # If CoT, generate first
     if do_cot:
         model.max_tokens = 256
@@ -199,6 +203,12 @@ def pairwise_compare(args, instruction_list, round_id):
         model = Llama2ModelLocal({"model": args.engine})
     elif "gpt" in args.engine:
         model = OpenAIChatModel({"model": args.engine})
+    elif "gemma" in args.engine:
+        model = LocalModel({'model': args.engine, 
+                    'temperature': 0, 
+                    'do_sample': False,
+                    'qa_style': False,
+                    'max_tokens': 32})
     saving_dir = args.saving_dir
     # Load prompt template
     for i_id, instruction in enumerate(instruction_list):
