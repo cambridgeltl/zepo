@@ -2,7 +2,7 @@
 
 ![zepo](figs/zepo.png)
 **Link to paper**:
-[Fairer Preferences Elicit Improved Human-Aligned Large Language Model Judgments](https://arxiv.org/abs/2406.11370). arXiv preprint arXiv:2406.11370.
+[Fairer Preferences Elicit Improved Human-Aligned Large Language Model Judgments](https://arxiv.org/abs/2406.11370). (Accepted to EMNLP 2024 Main)
 
 ## Installation
 
